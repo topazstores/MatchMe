@@ -1,44 +1,90 @@
-<?php 
+<?php
+/**
+ * Send fake messages to online users at random intervals
+ */
+
 function maybeSendFakeMessage($user, $db) {
     $now = time();
 
-    // First fake within 0–5 sec after register
-    $has_fake = $db->query("
-        SELECT 1 FROM messages 
-        WHERE user2='{$user->id}' AND is_fake_sent=1
-        LIMIT 1
-    ")->fetch_object();
-
-    if (!$has_fake) {
-        scheduleFakeMessage($user, $db, rand(0,5));
-        return;
-    }
-
-    // Allow MANY fakes, not just one
+    // --- 1. Check last fake message ---
     $last_fake = $db->query("
         SELECT time FROM messages 
         WHERE user2='{$user->id}' AND is_fake_sent=1 
         ORDER BY time DESC LIMIT 1
     ")->fetch_object();
 
-    $elapsed = $now - $last_fake->time;
-    $next_interval = rand(5, 1200); // 5s – 20 min
+    // --- 2. No fakes yet: send first within 0–5 sec ---
+    if (!$last_fake) {
+        scheduleFakeMessage($user, $db, rand(0, 5));
 
-    if ($elapsed >= $next_interval) {
+        // Store when next fake should come
+        $next_interval = rand(5, 1200);
+        $next_fake_time = $now + $next_interval;
+        $db->query("REPLACE INTO user_meta (user_id, next_fake_time) VALUES ('{$user->id}', '$next_fake_time')");
+        return;
+    }
+
+    // --- 3. Check stored schedule ---
+    $meta = $db->query("
+        SELECT next_fake_time FROM user_meta WHERE user_id='{$user->id}'
+    ")->fetch_object();
+
+    if (!$meta) {
+        // No schedule? Create one
+        $next_interval = rand(5, 1200);
+        $next_fake_time = $last_fake->time + $next_interval;
+        $db->query("REPLACE INTO user_meta (user_id, next_fake_time) VALUES ('{$user->id}', '$next_fake_time')");
+        return;
+    }
+
+    // --- 4. Time reached → send fake and reschedule ---
+    if ($now >= $meta->next_fake_time) {
         scheduleFakeMessage($user, $db, 0);
+
+        // Reschedule new fake
+        $next_interval = rand(5, 1200);
+        $next_fake_time = $now + $next_interval;
+        $db->query("UPDATE user_meta SET next_fake_time='$next_fake_time' WHERE user_id='{$user->id}'");
     }
 }
 
+/**
+ * Get online users (active in last 5 minutes)
+ */
+function getOnlineUsers($db, $online_window = 300) {
+    $now = time();
+    $result = $db->query("SELECT * FROM users WHERE last_active > ($now - $online_window)");
+    $users = [];
+    while ($user = $result->fetch_object()) {
+        $users[] = $user;
+    }
+    return $users;
+}
+
+/**
+ * Loop through online users and maybe send them fakes
+ * Run this via CRON or AJAX every ~30–60s
+ */
+function checkAndSendFakesForOnlineUsers($db) {
+    $onlineUsers = getOnlineUsers($db);
+    foreach ($onlineUsers as $user) {
+        maybeSendFakeMessage($user, $db);
+    }
+}
+
+/**
+ * Insert fake message
+ */
 function scheduleFakeMessage($user, $db, $delay) {
-    // Choose a fake user matching prefs
+    // Select fake user based on preferences
     $where = "is_fake=1";
-    if($user->sexual_interest == 1) { 
+    if ($user->sexual_interest == 1) { 
         $where .= $user->gender == 'Male' ? " AND gender='Female'" : " AND gender='Male'";
-    } elseif($user->sexual_interest == 2) { 
+    } elseif ($user->sexual_interest == 2) { 
         $where .= " AND gender='".$user->gender."'";
-    } elseif($user->sexual_interest == 3) { 
+    } elseif ($user->sexual_interest == 3) { 
         $where .= " AND gender='Female'";
-    } elseif($user->sexual_interest == 4) { 
+    } elseif ($user->sexual_interest == 4) { 
         $where .= " AND (gender='Male' OR gender='Female')";
     }
 
@@ -50,24 +96,23 @@ function scheduleFakeMessage($user, $db, $delay) {
 
     if (!$fake) return;
 
-    // Build giant pool of messages
+    // Build messages pool
     $mood_messages = buildFakeMessages();
-
-    // Flatten all
     $all_messages = [];
     foreach ($mood_messages as $msgs) {
         $all_messages = array_merge($all_messages, $msgs);
     }
 
-    // Pick random
+    // Pick random message
     $msg = $all_messages[array_rand($all_messages)];
 
-    // Avoid repeats
+    // Prevent duplicates for this user
     $sent = [];
     $rs = $db->query("SELECT message FROM messages WHERE user2='{$user->id}' AND is_fake_sent=1");
-    while($row = $rs->fetch_object()) $sent[] = $row->message;
+    while ($row = $rs->fetch_object()) $sent[] = $row->message;
     if (in_array($msg, $sent)) return;
 
+    // Optional delay
     if ($delay > 0) sleep($delay);
 
     $db->query("INSERT INTO messages 
